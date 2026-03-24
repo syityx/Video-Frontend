@@ -95,7 +95,16 @@
 
             <div class="magnet-content busy" v-else>
               <div class="quantum-loader"></div>
-              <span class="busy-text">正在建立通道并解析资源...</span>
+              <span class="busy-text">{{ busyText }}</span>
+              <div class="upload-progress-panel" v-if="uploading">
+                <div class="progress-track">
+                  <div class="progress-fill" :style="{ width: `${uploadProgress}%` }"></div>
+                </div>
+                <div class="progress-meta">
+                  <span>{{ uploadProgress }}%</span>
+                  <span>{{ uploadSpeedText }}</span>
+                </div>
+              </div>
             </div>
 
             <div class="border-glow"></div>
@@ -251,6 +260,22 @@ const authMessage = ref('')
 const authError = ref(false)
 const authForm = ref({ username: '', password: '', nickname: '' })
 const pollingTimers = ref({})
+const uploadProgress = ref(0)
+const uploadSpeedText = ref('--')
+
+const MEDIA_API_BASE = '/media'
+const CHUNK_UPLOAD_THRESHOLD = 100 * 1024 * 1024
+const DEFAULT_CHUNK_SIZE = 10 * 1024 * 1024
+const MAX_CHUNK_SIZE = 20 * 1024 * 1024
+const CHUNK_CONCURRENCY = 4
+const MAX_RETRY_ATTEMPTS = 3
+const RETRY_DELAY_MS = 800
+const CHUNK_SESSION_KEY = 'media_chunk_upload_session'
+
+const busyText = computed(() => {
+  if (!uploading.value) return ''
+  return message.value || '正在上传资源...'
+})
 
 // Markdown 解析
 const renderedMarkdown = computed(() => {
@@ -260,6 +285,430 @@ const renderedMarkdown = computed(() => {
   if (!cleanText.trim()) cleanText = sidebar.value.content
   return marked.parse(cleanText)
 })
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+
+const createHttpError = (status, msg, retryable = false, code = '') => {
+  const error = new Error(msg)
+  error.status = status
+  error.retryable = retryable
+  error.code = code
+  return error
+}
+
+const withRetry = async (task, options = {}) => {
+  const {
+    maxAttempts = MAX_RETRY_ATTEMPTS,
+    delayMs = RETRY_DELAY_MS,
+    shouldRetry = (error) => Boolean(error?.retryable),
+    onRetry
+  } = options
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await task(attempt)
+    } catch (error) {
+      const canRetry = attempt < maxAttempts && shouldRetry(error)
+      if (!canRetry) throw error
+      if (onRetry) onRetry(error, attempt, maxAttempts)
+      await sleep(delayMs * attempt)
+    }
+  }
+}
+
+const parseResponseBody = async (res) => {
+  const text = await res.text()
+  if (!text) return null
+  try {
+    return JSON.parse(text)
+  } catch {
+    return text
+  }
+}
+
+const formatSpeed = (bytesPerSecond) => {
+  if (!bytesPerSecond || !Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return '--'
+  const mb = bytesPerSecond / 1024 / 1024
+  if (mb >= 1) return `${mb.toFixed(2)} MB/s`
+  const kb = bytesPerSecond / 1024
+  return `${kb.toFixed(1)} KB/s`
+}
+
+const resetUploadStats = () => {
+  uploadProgress.value = 0
+  uploadSpeedText.value = '--'
+}
+
+const updateUploadStats = (uploadedChunks, totalChunks, uploadedBytes, startTime) => {
+  uploadProgress.value = Math.min(100, Number(((uploadedChunks / totalChunks) * 100).toFixed(2)))
+  const elapsedSec = Math.max((Date.now() - startTime) / 1000, 0.001)
+  uploadSpeedText.value = formatSpeed(uploadedBytes / elapsedSec)
+}
+
+const buildSessionPayload = (targetFile, uploadId, totalChunks, chunkSize) => ({
+  uploadId,
+  filename: targetFile.name,
+  fileSize: targetFile.size,
+  lastModified: targetFile.lastModified,
+  totalChunks,
+  chunkSize,
+  userId: currentUser.value?.id ?? null
+})
+
+const loadChunkSession = () => {
+  try {
+    const raw = localStorage.getItem(CHUNK_SESSION_KEY)
+    return raw ? JSON.parse(raw) : null
+  } catch {
+    return null
+  }
+}
+
+const saveChunkSession = (payload) => {
+  localStorage.setItem(CHUNK_SESSION_KEY, JSON.stringify(payload))
+}
+
+const clearChunkSession = () => {
+  localStorage.removeItem(CHUNK_SESSION_KEY)
+}
+
+const calculateChunkBytes = (targetFile, chunkIndex, chunkSize) => {
+  const start = chunkIndex * chunkSize
+  const end = Math.min(start + chunkSize, targetFile.size)
+  return Math.max(0, end - start)
+}
+
+const getUploadedBytes = (targetFile, uploadedChunks, chunkSize) => {
+  let total = 0
+  uploadedChunks.forEach((idx) => {
+    total += calculateChunkBytes(targetFile, idx, chunkSize)
+  })
+  return total
+}
+
+const getResumeSession = (targetFile, totalChunks, chunkSize) => {
+  const session = loadChunkSession()
+  if (!session) return null
+  if (session.filename !== targetFile.name) return null
+  if (session.fileSize !== targetFile.size) return null
+  if (session.lastModified !== targetFile.lastModified) return null
+  if (session.totalChunks !== totalChunks || session.chunkSize !== chunkSize) return null
+  if ((session.userId ?? null) !== (currentUser.value?.id ?? null)) return null
+  return session
+}
+
+const initUploadSession = async () => {
+  return withRetry(async () => {
+    let res
+    try {
+      res = await fetch(`${MEDIA_API_BASE}/init-upload`, { method: 'POST' })
+    } catch {
+      throw createHttpError(0, '网络异常，无法初始化上传会话', true)
+    }
+
+    const data = await parseResponseBody(res)
+    if (res.status >= 500) throw createHttpError(res.status, '服务异常，初始化上传会话失败', true)
+    if (!res.ok) throw createHttpError(res.status, typeof data === 'string' ? data : '初始化上传会话失败')
+
+    const uploadId = typeof data === 'string' ? data : data?.uploadId
+    if (!uploadId) throw createHttpError(res.status, '初始化上传会话成功但未返回 uploadId')
+    return uploadId
+  }, {
+    onRetry: (_, attempt, maxAttempts) => {
+      message.value = `初始化上传会话失败，重试中 (${attempt}/${maxAttempts - 1})...`
+    }
+  })
+}
+
+const fetchUploadProgress = async (uploadId, totalChunks) => {
+  return withRetry(async () => {
+    let res
+    try {
+      const query = new URLSearchParams({ uploadId, totalChunks: String(totalChunks) })
+      res = await fetch(`${MEDIA_API_BASE}/upload-progress?${query.toString()}`)
+    } catch {
+      throw createHttpError(0, '网络异常，无法获取上传进度', true)
+    }
+
+    const data = await parseResponseBody(res)
+    if (res.status >= 500) throw createHttpError(res.status, '服务异常，获取上传进度失败', true)
+    if (!res.ok) throw createHttpError(res.status, typeof data === 'string' ? data : '获取上传进度失败')
+    if (typeof data !== 'object' || data === null) {
+      return { uploadedChunks: [], uploadedCount: 0, totalChunks, completed: false }
+    }
+
+    return {
+      uploadId: data.uploadId || uploadId,
+      uploadedChunks: Array.isArray(data.uploadedChunks) ? data.uploadedChunks : [],
+      uploadedCount: Number(data.uploadedCount || 0),
+      totalChunks: Number(data.totalChunks || totalChunks),
+      completed: Boolean(data.completed)
+    }
+  }, {
+    onRetry: (_, attempt, maxAttempts) => {
+      message.value = `读取断点进度失败，重试中 (${attempt}/${maxAttempts - 1})...`
+    }
+  })
+}
+
+const uploadChunk = async (uploadId, chunkIndex, blob) => {
+  return withRetry(async () => {
+    const formData = new FormData()
+    formData.append('uploadId', uploadId)
+    formData.append('chunkIndex', String(chunkIndex))
+    formData.append('file', blob)
+
+    let res
+    try {
+      res = await fetch(`${MEDIA_API_BASE}/upload-chunk`, {
+        method: 'POST',
+        body: formData
+      })
+    } catch {
+      throw createHttpError(0, `分片 ${chunkIndex} 上传网络异常`, true)
+    }
+
+    const data = await parseResponseBody(res)
+
+    if (res.status === 400) {
+      throw createHttpError(400, `分片 ${chunkIndex} 上传失败：参数错误或 uploadId 失效，请重新开始上传`, false, 'UPLOAD_ID_INVALID')
+    }
+    if (res.status >= 500) {
+      throw createHttpError(res.status, `分片 ${chunkIndex} 上传失败，服务异常`, true)
+    }
+    if (!res.ok) {
+      const detail = typeof data === 'string' ? data : `分片 ${chunkIndex} 上传失败`
+      throw createHttpError(res.status, detail)
+    }
+    return data
+  }, {
+    onRetry: (_, attempt, maxAttempts) => {
+      message.value = `分片上传失败，重试中 (${attempt}/${maxAttempts - 1})...`
+    }
+  })
+}
+
+const completeUpload = async (uploadId, filename, totalChunks) => {
+  return withRetry(async () => {
+    const formData = new FormData()
+    formData.append('uploadId', uploadId)
+    formData.append('filename', filename)
+    formData.append('totalChunks', String(totalChunks))
+    if (currentUser.value?.id != null) formData.append('userId', String(currentUser.value.id))
+
+    let res
+    try {
+      res = await fetch(`${MEDIA_API_BASE}/complete-upload`, {
+        method: 'POST',
+        body: formData
+      })
+    } catch {
+      throw createHttpError(0, '网络异常，合并请求失败', true)
+    }
+
+    const data = await parseResponseBody(res)
+
+    if (res.status === 409) {
+      throw createHttpError(409, '分片未完整上传，准备补传缺失分片', false, 'INCOMPLETE_CHUNKS')
+    }
+    if (res.status >= 500) {
+      throw createHttpError(res.status, '服务异常，合并请求失败', true)
+    }
+    if (!res.ok) {
+      const detail = typeof data === 'string' ? data : '合并请求失败'
+      throw createHttpError(res.status, detail)
+    }
+
+    return data
+  }, {
+    onRetry: (_, attempt, maxAttempts) => {
+      message.value = `文件合并失败，重试中 (${attempt}/${maxAttempts - 1})...`
+    }
+  })
+}
+
+const uploadMissingChunksConcurrently = async (targetFile, uploadId, missingChunkIndexes, chunkSize, uploadedSet, totalChunks, uploadedBytesState, startTime) => {
+  if (missingChunkIndexes.length === 0) return
+
+  const queue = [...missingChunkIndexes]
+  const workerCount = Math.min(CHUNK_CONCURRENCY, queue.length)
+  let fatalError = null
+
+  const worker = async () => {
+    while (queue.length > 0 && !fatalError) {
+      const chunkIndex = queue.shift()
+      const start = chunkIndex * chunkSize
+      const end = Math.min(start + chunkSize, targetFile.size)
+      const blob = targetFile.slice(start, end)
+
+      try {
+        await uploadChunk(uploadId, chunkIndex, blob)
+        if (!uploadedSet.has(chunkIndex)) {
+          uploadedSet.add(chunkIndex)
+          uploadedBytesState.value += blob.size
+        }
+        updateUploadStats(uploadedSet.size, totalChunks, uploadedBytesState.value, startTime)
+        message.value = `分片上传中 ${uploadedSet.size}/${totalChunks}`
+      } catch (error) {
+        fatalError = error
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()))
+  if (fatalError) throw fatalError
+}
+
+const uploadFileNormally = async (targetFile) => {
+  message.value = '正在进行普通上传...'
+
+  await withRetry(async () => {
+    const formData = new FormData()
+    formData.append('file', targetFile)
+    if (currentUser.value?.id != null) formData.append('userId', String(currentUser.value.id))
+
+    let res
+    try {
+      res = await fetch(`${MEDIA_API_BASE}/upload`, {
+        method: 'POST',
+        body: formData
+      })
+    } catch {
+      throw createHttpError(0, '网络异常，普通上传失败', true)
+    }
+
+    const data = await parseResponseBody(res)
+    if (res.status >= 500) throw createHttpError(res.status, '服务异常，普通上传失败', true)
+    if (!res.ok) {
+      const detail = typeof data === 'string' ? data : '普通上传失败'
+      throw createHttpError(res.status, detail)
+    }
+  }, {
+    onRetry: (_, attempt, maxAttempts) => {
+      message.value = `普通上传失败，重试中 (${attempt}/${maxAttempts - 1})...`
+    }
+  })
+
+  uploadProgress.value = 100
+  uploadSpeedText.value = '--'
+}
+
+const uploadFileByChunks = async (targetFile) => {
+  const chunkSize = Math.min(DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE)
+  const totalChunks = Math.ceil(targetFile.size / chunkSize)
+  const startTime = Date.now()
+  const uploadedBytesState = { value: 0 }
+
+  let uploadId = ''
+  const resumeSession = getResumeSession(targetFile, totalChunks, chunkSize)
+
+  if (resumeSession?.uploadId) {
+    uploadId = resumeSession.uploadId
+    message.value = '检测到历史会话，正在断点续传...'
+  } else {
+    message.value = '正在初始化分片上传会话...'
+    uploadId = await initUploadSession()
+    saveChunkSession(buildSessionPayload(targetFile, uploadId, totalChunks, chunkSize))
+  }
+
+  const progressInfo = await fetchUploadProgress(uploadId, totalChunks)
+  const uploadedSet = new Set(progressInfo.uploadedChunks)
+
+  uploadedBytesState.value = getUploadedBytes(targetFile, uploadedSet, chunkSize)
+  updateUploadStats(uploadedSet.size, totalChunks, uploadedBytesState.value, startTime)
+
+  const missingChunkIndexes = []
+  for (let i = 0; i < totalChunks; i++) {
+    if (!uploadedSet.has(i)) missingChunkIndexes.push(i)
+  }
+
+  message.value = missingChunkIndexes.length === 0
+    ? '所有分片已上传，准备请求合并...'
+    : `准备上传 ${missingChunkIndexes.length} 个缺失分片...`
+
+  await uploadMissingChunksConcurrently(
+    targetFile,
+    uploadId,
+    missingChunkIndexes,
+    chunkSize,
+    uploadedSet,
+    totalChunks,
+    uploadedBytesState,
+    startTime
+  )
+
+  let completeResult = null
+  for (let completeAttempt = 1; completeAttempt <= 2; completeAttempt++) {
+    try {
+      message.value = '分片上传完成，正在请求服务器合并文件...'
+      completeResult = await completeUpload(uploadId, targetFile.name, totalChunks)
+      break
+    } catch (error) {
+      if (error.code !== 'INCOMPLETE_CHUNKS' || completeAttempt === 2) throw error
+
+      message.value = '后端返回分片不完整，正在查询缺片并补传...'
+      const latestProgress = await fetchUploadProgress(uploadId, totalChunks)
+      const missingAfterComplete = []
+      const latestSet = new Set(latestProgress.uploadedChunks)
+      for (let i = 0; i < totalChunks; i++) {
+        if (!latestSet.has(i)) missingAfterComplete.push(i)
+      }
+
+      uploadedSet.clear()
+      latestSet.forEach((idx) => uploadedSet.add(idx))
+      uploadedBytesState.value = getUploadedBytes(targetFile, uploadedSet, chunkSize)
+      updateUploadStats(uploadedSet.size, totalChunks, uploadedBytesState.value, startTime)
+
+      await uploadMissingChunksConcurrently(
+        targetFile,
+        uploadId,
+        missingAfterComplete,
+        chunkSize,
+        uploadedSet,
+        totalChunks,
+        uploadedBytesState,
+        startTime
+      )
+    }
+  }
+
+  uploadProgress.value = 100
+  clearChunkSession()
+  return completeResult
+}
+
+// 【普通上传 + 分片上传】
+const uploadFile = async () => {
+  if (!file.value) return
+
+  uploading.value = true
+  resetUploadStats()
+
+  try {
+    const targetFile = file.value
+    const shouldUseChunkUpload = targetFile.size >= CHUNK_UPLOAD_THRESHOLD
+
+    if (shouldUseChunkUpload) {
+      await uploadFileByChunks(targetFile)
+      showMsg('✅ 分片上传并合并完成')
+    } else {
+      await uploadFileNormally(targetFile)
+      showMsg('✅ 普通上传完成')
+    }
+
+    await fetchList()
+  } catch (error) {
+    console.error(error)
+    if (error.code === 'UPLOAD_ID_INVALID') {
+      clearChunkSession()
+      showMsg('❌ uploadId 已失效，请重新开始上传', true)
+    } else {
+      showMsg(`❌ 上传失败: ${error.message || '未知错误'}`, true)
+    }
+  } finally {
+    uploading.value = false
+  }
+}
 
 // --- 核心业务逻辑 ---
 
@@ -294,33 +743,6 @@ const handleDrop = async (e) => {
   file.value = selectedFile
   videoUrl.value = ''
   await uploadFile()
-}
-
-// 【普通文件上传】
-const uploadFile = async () => {
-  if (!file.value) return
-  uploading.value = true
-  message.value = '正在建立加密通道并上传数据...'
-  const formData = new FormData()
-  formData.append('file', file.value)
-  if (currentUser.value) formData.append('userId', currentUser.value.id)
-
-  try {
-    const res = await fetch('http://localhost:9090/media/upload', {
-      method: 'POST',
-      body: formData
-    })
-    const text = await res.text()
-    if (!res.ok) throw new Error(text || 'Upload failed')
-
-    showMsg('✅ 本地上传完成')
-    fetchList()
-  } catch (error) {
-    console.error(error)
-    showMsg('❌ 上传失败: ' + error.message, true)
-  } finally {
-    uploading.value = false
-  }
 }
 
 // 【链接上传 - 修复版】
@@ -802,6 +1224,10 @@ html, body, #app {
   background: var(--bg-card); position: relative; z-index: 50;
 }
 .busy-text { margin-top: 15px; color: var(--accent-lime); font-family: monospace; animation: pulse-lime 2s infinite; }
+.upload-progress-panel { width: min(420px, 80%); margin-top: 16px; }
+.progress-track { width: 100%; height: 10px; border-radius: 999px; border: 1px solid var(--border-tech); background: rgba(255,255,255,0.06); overflow: hidden; }
+.progress-fill { height: 100%; background: linear-gradient(90deg, #7acd25, #c5f946); box-shadow: 0 0 10px rgba(197, 249, 70, 0.35); transition: width 0.25s ease; }
+.progress-meta { margin-top: 8px; display: flex; justify-content: space-between; color: var(--text-sub); font-size: 0.82rem; font-family: monospace; }
 /* === [END] 重构结束 === */
 
 .notification-bar { margin-top: 2rem; display: inline-block; background: var(--accent-lime); color: var(--text-inverse); padding: 10px 24px; font-weight: 700; border-radius: 4px; clip-path: polygon(5% 0%, 100% 0%, 95% 100%, 0% 100%); }
