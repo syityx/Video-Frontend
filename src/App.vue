@@ -67,6 +67,9 @@
                 </div>
               </label>
 
+              <!--
+              WEB LINK 面板按需求暂时隐藏，仅保留 LOCAL FILE 上传入口。
+              这里保留原始模板，后续如果要恢复链接上传，取消注释即可。
               <div class="split-gap"></div>
 
               <div class="skew-pane pane-url">
@@ -90,6 +93,7 @@
                   </div>
                 </div>
               </div>
+              -->
 
             </div>
 
@@ -1176,6 +1180,20 @@ html, body, #app {
 /* 增加左右面板的宽度，确保覆盖边缘 */
 .pane-local { margin-left: -20px; padding-right: 20px; border-right: 2px solid var(--accent-lime); }
 .pane-url { margin-right: -20px; padding-left: 20px; }
+
+/* 仅保留本地上传入口时，恢复为单面板布局，避免倾斜和留白。 */
+.split-container .pane-local:only-child {
+  margin-left: 0;
+  padding-right: 0;
+  border-right: none;
+  transform: none;
+}
+.split-container .pane-local:only-child .pane-content {
+  transform: none;
+}
+.split-container .pane-local:only-child:hover .pane-content {
+  transform: scale(1.05);
+}
 
 /* 鼠标悬停逻辑：只改变背景色，不加外发光，防止穿模 */
 .skew-pane:hover {

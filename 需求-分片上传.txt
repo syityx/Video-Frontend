@@ -1,0 +1,89 @@
+请按以下后端接口协议改造上传模块，目标是支持大文件分片上传、断点续传和失败重传。
+
+后端接口基址：
+/media
+
+一、普通上传与分片上传的选择策略
+
+前端先读取文件大小。
+小文件走普通上传接口：POST /media/upload
+大文件走分片上传流程。
+建议阈值：文件大小大于等于 100MB 时走分片上传。
+注意后端当前单请求限制是 200MB，不要让单个分片超过该值，建议分片大小 5MB 到 20MB。
+二、分片上传完整流程
+步骤1：初始化上传会话
+请求：
+POST /media/init-upload
+参数：无
+返回：uploadId（字符串）
+
+步骤2：按分片循环上传
+请求：
+POST /media/upload-chunk
+Content-Type: multipart/form-data
+表单字段：
+uploadId: string
+chunkIndex: number（从0开始）
+file: 当前分片二进制
+成功返回示例：
+{
+"uploadId": "xxxx",
+"chunkIndex": 0,
+"size": 5242880,
+"message": "chunk uploaded"
+}
+
+步骤3：可选进度查询（用于断点续传）
+请求：
+GET /media/upload-progress?uploadId=xxxx&totalChunks=100
+成功返回示例：
+{
+"uploadId": "xxxx",
+"uploadedChunks": [0,1,2,5,6],
+"uploadedCount": 5,
+"totalChunks": 100,
+"completed": false
+}
+说明：
+uploadedChunks 是后端已收到的分片下标，前端据此补传缺失分片。
+
+步骤4：全部分片上传后通知后端合并
+请求：
+POST /media/complete-upload
+参数：
+uploadId: string
+filename: 原始文件名（如 abc.mp4）
+totalChunks: number（总分片数）
+userId: number（可选）
+成功返回示例：
+{
+"uploadId": "xxxx",
+"fileUrl": "http://.../bucket/xxx.mp4",
+"mediaId": 123,
+"message": "complete"
+}
+
+三、异常处理要求
+
+upload-chunk 返回 400：参数问题或 uploadId 失效，前端提示重新开始上传。
+complete-upload 返回 409：分片不完整，前端先调 upload-progress 补传缺片再重试 complete-upload。
+任意接口 500：按可重试策略处理，建议重试 2 到 3 次，仍失败则提示用户。
+四、前端实现要求
+
+分片切割：chunkSize 建议默认 10MB。
+并发上传：建议并发数 3 到 5。
+失败重传：单分片失败自动重试，重试上限 2 到 3 次。
+断点续传：进入上传页或重试时先调用 upload-progress，跳过已上传分片。
+进度展示：
+总进度 = 已成功分片数 / 总分片数
+上传速度可按分片完成时间估算。
+最终完成：
+全部分片成功后，必须调用 complete-upload，成功后再刷新媒体列表。
+五、普通上传保持不变
+普通上传接口仍保留：
+POST /media/upload
+参数：
+file: MultipartFile
+userId: Long（可选）
+
+请按以上协议改造前端上传模块，并确保普通上传与分片上传共存。
